@@ -1,8 +1,13 @@
 param(
     [Parameter(Mandatory)]
     [ValidateSet('3b', '7b')]
-    [string]$ModelSize
+    [string]$ModelSize,
+
+    [string]$ProjectDir = (Get-Location).Path
 )
+
+. "$PSScriptRoot\log-event.ps1"
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 $freeRamGB = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
 
@@ -56,4 +61,9 @@ if ($ModelSize -eq '7b') {
 # `powershell -File ... | ConvertFrom-Json` get the full, untruncated Message
 # text and a reliably parseable object back - matches SKILL.md's updated
 # invocation instructions.
+Write-DelegationEvent -Skill 'delegate-cline' -Mode 'local-model' -ProjectDir $ProjectDir -Model "qwen2.5-coder:$ModelSize" `
+    -TaskDescription 'RAM preflight' -Outcome $(if ($result.Proceed) { 'success' } else { 'blocked' }) `
+    -Guard $(if ($result.Proceed) { $null } else { 'ram_preflight' }) -Reason $result.Message `
+    -DurationSeconds $stopwatch.Elapsed.TotalSeconds
+
 $result | ConvertTo-Json -Compress

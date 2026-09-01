@@ -11,6 +11,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot\parse-cline-json.ps1"
+. "$PSScriptRoot\log-event.ps1"
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$clineIncomplete = $false
 
 # VERIFIED 2026-08-31 (final fix wave, Finding 4): under
 # $ErrorActionPreference = 'Stop', a native command's stderr output is wrapped
@@ -108,6 +111,9 @@ $newWorktrees = $worktreesAfter | Where-Object { $worktreesBefore -notcontains $
 $worktreePath = $newWorktrees | Where-Object { $_ -match '\.cline[\\/]worktrees' } | Select-Object -First 1
 
 if (-not $worktreePath) {
+    Write-DelegationEvent -Skill 'delegate-cline' -Mode 'implement' -ProjectDir $ProjectDir -Model $activeProvider `
+        -TaskDescription $TaskDescription -Outcome 'failed' -Reason 'could not locate a new cline worktree via git worktree list' `
+        -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Could not locate a new cline worktree via 'git worktree list' - cannot safely show what changed." -ForegroundColor Red
     Write-Host "--- raw output ---"
     Write-Host $result.RawOutput
@@ -119,6 +125,7 @@ if (-not $worktreePath) {
 $worktreePath = $worktreePath -replace '/', '\'
 
 if ($exitCode -ne 0 -or -not $result.Success) {
+    $clineIncomplete = $true
     Write-Host "Cline implement task did not complete cleanly (exit $exitCode, reason: $($result.Reason))" -ForegroundColor Red
 }
 
@@ -158,11 +165,17 @@ $worktreeStatus = & git -C $worktreePath status --porcelain
 if ($worktreeStatus) {
     & git -C $worktreePath add -A
     if ($LASTEXITCODE -ne 0) {
+        Write-DelegationEvent -Skill 'delegate-cline' -Mode 'implement' -ProjectDir $ProjectDir -Model $activeProvider `
+            -TaskDescription $TaskDescription -Outcome 'failed' -Reason "git add -A failed in the worktree (exit $LASTEXITCODE)" `
+            -DurationSeconds $stopwatch.Elapsed.TotalSeconds
         Write-Host "git add -A failed in the worktree (exit $LASTEXITCODE) - refusing to present a diff that may not reflect all of cline's changes." -ForegroundColor Red
         exit 1
     }
     & git -C $worktreePath commit -m "delegate-cline implement: $promptText" | Out-Null
     if ($LASTEXITCODE -ne 0) {
+        Write-DelegationEvent -Skill 'delegate-cline' -Mode 'implement' -ProjectDir $ProjectDir -Model $activeProvider `
+            -TaskDescription $TaskDescription -Outcome 'failed' -Reason "git commit failed in the worktree (exit $LASTEXITCODE)" `
+            -DurationSeconds $stopwatch.Elapsed.TotalSeconds
         Write-Host "git commit failed in the worktree (exit $LASTEXITCODE) - refusing to present a diff/merge instructions for a change that was never actually committed." -ForegroundColor Red
         exit 1
     }
@@ -215,10 +228,30 @@ $mergeBase = if ($baseBranch) { ((& git -C $worktreePath merge-base HEAD $baseBr
 $ErrorActionPreference = $prevEAP
 
 if (-not $mergeBase) {
-    $mergeBase = ((& git -C $ProjectDir rev-parse HEAD) -join '').Trim()
+    # VERIFIED 2026-09-02: plain `git rev-parse HEAD` on a repo with no
+    # commits (unborn HEAD) does not fail silently - it echoes the literal
+    # argument "HEAD" back to stdout while writing the real error to stderr
+    # (confirmed live: exit 128, stdout is the 4-character string "HEAD").
+    # The old code here only checked truthiness, so that literal string
+    # passed as non-empty and got used as a real base ref two lines below -
+    # a git-quirk route to the same "empty diff presented as complete"
+    # failure class every other guard in this project exists to prevent,
+    # just reached via `git diff "HEAD..HEAD"` instead of an unresolved
+    # $mergeBase. `--verify` fails cleanly instead of echoing the argument.
+    # Also scoped like the merge-base call above: under this script's
+    # $ErrorActionPreference = 'Stop', a failing native command's stderr
+    # write would otherwise become a terminating NativeCommandError here,
+    # for the same reason documented elsewhere in this file (Finding 4).
+    $prevEAPBase = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $mergeBase = ((& git -C $ProjectDir rev-parse --verify HEAD 2>$null) -join '').Trim()
+    $ErrorActionPreference = $prevEAPBase
 }
 
 if (-not $mergeBase) {
+    Write-DelegationEvent -Skill 'delegate-cline' -Mode 'implement' -ProjectDir $ProjectDir -Model $activeProvider `
+        -TaskDescription $TaskDescription -Outcome 'failed' -Guard 'unresolvable_base' `
+        -Reason 'could not resolve any base commit to diff against' -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Could not resolve any base commit to diff against (the real project has no resolvable branch or HEAD) - refusing to print a diff, since an unguarded empty base would silently present zero changes as a complete, safe-to-merge task." -ForegroundColor Red
     exit 1
 }
@@ -244,11 +277,18 @@ $diffOutput = (& git -C $worktreePath diff "$mergeBase..HEAD") -join "`n"
 # directions). Refuse to offer merge instructions for an empty diff; cline's
 # own summary (printed above) still reaches the user either way.
 if (-not ($diffOutput -and $diffOutput.Trim())) {
+    Write-DelegationEvent -Skill 'delegate-cline' -Mode 'implement' -ProjectDir $ProjectDir -Model $activeProvider `
+        -TaskDescription $TaskDescription -Outcome 'failed' -Guard 'empty_diff' `
+        -Reason "cline reported completion but the worktree diff against $mergeBase is empty" -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Cline reported completion but the worktree diff against $mergeBase is EMPTY - no files were actually changed. Refusing to print merge instructions for a no-op $refLabel." -ForegroundColor Red
     Write-Host "The worktree at '$worktreePath' still exists. To discard it:"
     Write-Host "  git -C `"$ProjectDir`" worktree remove `"$worktreePath`" --force"
     exit 1
 }
+
+$finalReason = if ($clineIncomplete) { 'cline reported an incomplete/non-clean finish but a non-empty diff was produced - review carefully' } else { 'completed' }
+Write-DelegationEvent -Skill 'delegate-cline' -Mode 'implement' -ProjectDir $ProjectDir -Model $activeProvider `
+    -TaskDescription $TaskDescription -Outcome 'success' -Reason $finalReason -DurationSeconds $stopwatch.Elapsed.TotalSeconds
 
 Write-Host "`n--- Full diff of everything cline did on $refLabel ---" -ForegroundColor Cyan
 Write-Host $diffOutput

@@ -13,6 +13,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot\parse-agy-json.ps1"
+. "$PSScriptRoot\log-event.ps1"
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$agyIncomplete = $false
+$agyModel = if ($Model) { $Model } else { 'default' }
 
 # Prints the two commands (in the order they must be run - removing the
 # worktree before deleting the branch, since a branch still checked out into a
@@ -84,6 +88,9 @@ $branchName = "delegate-agy-$worktreeId"
 
 & git -C $ProjectDir worktree add $worktreePath -b $branchName
 if ($LASTEXITCODE -ne 0) {
+    Write-DelegationEvent -Skill 'delegate-agy' -Mode 'implement' -ProjectDir $ProjectDir -Model $agyModel `
+        -TaskDescription $TaskDescription -Outcome 'failed' -Reason 'could not create an isolated worktree' `
+        -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Could not create an isolated worktree - refusing to invoke Agy with --mode accept-edits directly against the real project." -ForegroundColor Red
     exit 1
 }
@@ -114,6 +121,7 @@ $ErrorActionPreference = $prevEAP
 $result = Get-AgyResult -OutputFile $outFile
 
 if ($exitCode -ne 0 -or -not $result.Success) {
+    $agyIncomplete = $true
     Write-Host "Agy implement task did not complete cleanly (exit $exitCode, reason: $($result.Reason))" -ForegroundColor Red
 }
 
@@ -126,6 +134,9 @@ $worktreeStatus = & git -C $worktreePath status --porcelain
 if ($worktreeStatus) {
     & git -C $worktreePath add -A
     if ($LASTEXITCODE -ne 0) {
+        Write-DelegationEvent -Skill 'delegate-agy' -Mode 'implement' -ProjectDir $ProjectDir -Model $agyModel `
+            -TaskDescription $TaskDescription -Outcome 'failed' -Reason "git add -A failed in the worktree (exit $LASTEXITCODE)" `
+            -DurationSeconds $stopwatch.Elapsed.TotalSeconds
         Write-Host "git add -A failed in the worktree (exit $LASTEXITCODE) - refusing to present a diff that may not reflect all of Agy's changes." -ForegroundColor Red
         Write-Host "The worktree at '$worktreePath' (branch '$branchName') still exists. To discard it:"
         Write-DiscardInstructions -ProjectDir $ProjectDir -WorktreePath $worktreePath -BranchName $branchName
@@ -133,6 +144,9 @@ if ($worktreeStatus) {
     }
     & git -C $worktreePath commit -m "delegate-agy implement: $promptText" | Out-Null
     if ($LASTEXITCODE -ne 0) {
+        Write-DelegationEvent -Skill 'delegate-agy' -Mode 'implement' -ProjectDir $ProjectDir -Model $agyModel `
+            -TaskDescription $TaskDescription -Outcome 'failed' -Reason "git commit failed in the worktree (exit $LASTEXITCODE)" `
+            -DurationSeconds $stopwatch.Elapsed.TotalSeconds
         Write-Host "git commit failed in the worktree (exit $LASTEXITCODE) - refusing to present a diff/merge instructions for a change that was never actually committed." -ForegroundColor Red
         Write-Host "The worktree at '$worktreePath' (branch '$branchName') still exists. To discard it:"
         Write-DiscardInstructions -ProjectDir $ProjectDir -WorktreePath $worktreePath -BranchName $branchName
@@ -153,10 +167,36 @@ $mergeBase = if ($baseBranch) { ((& git -C $worktreePath merge-base HEAD $baseBr
 $ErrorActionPreference = $prevEAP2
 
 if (-not $mergeBase) {
-    $mergeBase = ((& git -C $ProjectDir rev-parse HEAD) -join '').Trim()
+    # VERIFIED 2026-09-02: plain `git rev-parse HEAD` on a repo with no
+    # commits (unborn HEAD, e.g. $ProjectDir was `git init`'d but never
+    # committed to) does not fail silently - it echoes the literal argument
+    # "HEAD" back to stdout while the real error goes to stderr (confirmed
+    # live: exit 128, stdout is the 4-character string "HEAD"). The old code
+    # here only checked truthiness, so that literal string passed as
+    # non-empty and got used as a real base ref two lines below - live
+    # reproduced: this exact scenario (agy's own worktree tooling creates an
+    # orphan branch even from a zero-commit $ProjectDir, unlike cline's,
+    # which refuses outright) produced a diff against the literal string
+    # "HEAD" instead of hitting the unresolvable_base guard, and got
+    # misclassified as an empty-diff no-op. `--verify` fails cleanly instead
+    # of echoing the argument back.
+    # Same $ErrorActionPreference scoping as the merge-base call above (and
+    # documented at length elsewhere in this project): under this script's
+    # global $ErrorActionPreference = 'Stop', a failing native command's
+    # stderr write becomes a terminating NativeCommandError even with
+    # `2>$null` present - live-reproduced here (`--verify`'s "fatal: Needed
+    # a single revision" crashed the script before this fallback could ever
+    # return, masking the intended unresolvable_base handling below).
+    $prevEAPBase = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $mergeBase = ((& git -C $ProjectDir rev-parse --verify HEAD 2>$null) -join '').Trim()
+    $ErrorActionPreference = $prevEAPBase
 }
 
 if (-not $mergeBase) {
+    Write-DelegationEvent -Skill 'delegate-agy' -Mode 'implement' -ProjectDir $ProjectDir -Model $agyModel `
+        -TaskDescription $TaskDescription -Outcome 'failed' -Guard 'unresolvable_base' `
+        -Reason 'could not resolve any base commit to diff against' -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Could not resolve any base commit to diff against - refusing to print a diff, since an unguarded empty base would silently present zero changes as a complete, safe-to-merge task." -ForegroundColor Red
     Write-Host "The worktree at '$worktreePath' (branch '$branchName') still exists. To discard it:"
     Write-DiscardInstructions -ProjectDir $ProjectDir -WorktreePath $worktreePath -BranchName $branchName
@@ -177,11 +217,18 @@ $diffOutput = (& git -C $worktreePath diff "$mergeBase..HEAD") -join "`n"
 # different route. Refuse to offer merge instructions for an empty diff;
 # Agy's own summary (printed above) still reaches the user either way.
 if (-not ($diffOutput -and $diffOutput.Trim())) {
+    Write-DelegationEvent -Skill 'delegate-agy' -Mode 'implement' -ProjectDir $ProjectDir -Model $agyModel `
+        -TaskDescription $TaskDescription -Outcome 'failed' -Guard 'empty_diff' `
+        -Reason "agy reported completion but the worktree diff against $mergeBase is empty" -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Agy reported completion but the worktree diff against $mergeBase is EMPTY - no files were actually changed. Refusing to print merge instructions for a no-op branch." -ForegroundColor Red
     Write-Host "The worktree at '$worktreePath' (branch '$branchName') still exists. To discard it:"
     Write-DiscardInstructions -ProjectDir $ProjectDir -WorktreePath $worktreePath -BranchName $branchName
     exit 1
 }
+
+$finalReason = if ($agyIncomplete) { 'agy reported an incomplete/non-clean finish but a non-empty diff was produced - review carefully' } else { 'completed' }
+Write-DelegationEvent -Skill 'delegate-agy' -Mode 'implement' -ProjectDir $ProjectDir -Model $agyModel `
+    -TaskDescription $TaskDescription -Outcome 'success' -Reason $finalReason -DurationSeconds $stopwatch.Elapsed.TotalSeconds
 
 Write-Host "`n--- Full diff of everything Agy did on branch '$branchName' (worktree: $worktreePath) ---" -ForegroundColor Cyan
 Write-Host $diffOutput

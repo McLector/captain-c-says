@@ -18,7 +18,9 @@ Both skills work the same way:
 
 Both are **on-demand only** — Claude Code will offer to delegate, but never fires either skill without you asking first.
 
-Both scripts are defended against the same failure class: a target CLI reporting success while silently doing nothing (an empty response, an empty diff, or a diff that can't be resolved against a real base commit) is always treated as a failure, never presented as a completed task.
+Both scripts are defended against the same failure class: a target CLI reporting success while silently doing nothing (an empty response, an empty diff, a diff that can't be resolved against a real base commit, or — for the local model path — generation that got cut off before finishing) is always treated as a failure, never presented as a completed task.
+
+Every run of every script — success, blocked, or failed — appends one line to a shared, append-only audit log at `~/.claude/delegation-log/events.jsonl`: which target, which model, what happened, and which guard (if any) caught it. Nothing is fabricated in that log — a token count you can't actually get from a target is logged as `null`, not guessed.
 
 ## Requirements
 
@@ -27,6 +29,7 @@ Both scripts are defended against the same failure class: a target CLI reporting
 - The relevant CLI installed and authenticated:
   - [`cline`](https://github.com/cline/cline) for `delegate-cline`
   - `agy` for `delegate-agy` (no local/on-device model option — every call sends content to Agy's hosted Google backend; the skill discloses this before every send)
+- Optional, for `delegate-cline`'s local-model path: [Ollama](https://ollama.com) running locally with `qwen2.5-coder:3b` and/or `:7b` pulled. This is a separate direct-API path (bypasses the `cline` CLI entirely) — see `delegate-cline`'s SKILL.md for how the RAM and token-budget pre-flight checks gate it before anything is sent.
 
 ## Install
 
@@ -53,6 +56,8 @@ Claude Code reads the relevant `SKILL.md`, runs the matching script, and walks y
 - Every prompt/description sent to a target CLI is passed as a PowerShell argument-array element (never interpolated into a single command string), with Windows-argv quote-escaping applied — a naive `.Replace('"', '\"')` is not enough on Windows and will corrupt embedded quotes.
 - Implement mode never touches your real working tree directly. `cline`'s own `--worktree` flag handles isolation for `delegate-cline`; `agy` has no equivalent flag, so `delegate-agy`'s `implement.ps1` creates and manages its own worktree.
 - Both skills refuse to print a diff or merge instructions when the base commit can't be resolved, or when the resulting diff is empty — silent no-ops are always surfaced as failures.
+- The audit log is deliberately duplicated between the two skills rather than shared — each skill folder stays self-contained and independently copyable, matching the install instructions above.
+- Every preflight (RAM, token-budget) shows you the numbers and a recommendation, then waits — nothing here ever auto-switches models or targets on your behalf.
 
 ## License
 

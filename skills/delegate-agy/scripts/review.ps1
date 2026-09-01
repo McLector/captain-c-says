@@ -15,6 +15,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot\parse-agy-json.ps1"
+. "$PSScriptRoot\log-event.ps1"
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # See delegate-cline's review.ps1 for the full explanation of why this
 # $ErrorActionPreference scoping trick is needed around a native command whose
@@ -145,11 +147,26 @@ $ErrorActionPreference = $prevEAP
 $result = Get-AgyResult -OutputFile $outFile
 
 if ($exitCode -ne 0 -or -not $result.Success) {
+    $guard = if ($changedLines -gt $MaxDiffLines) { 'oversized_diff' } elseif ($result.Reason -match 'empty response') { 'empty_response' } else { $null }
+    $agyModel = if ($Model) { $Model } else { 'default' }
+    Write-DelegationEvent -Skill 'delegate-agy' -Mode 'review' -ProjectDir $ProjectDir -Model $agyModel `
+        -TaskDescription $Description -Outcome 'failed' -Guard $guard -Reason $result.Reason `
+        -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Agy review FAILED (exit $exitCode, reason: $($result.Reason))" -ForegroundColor Red
     Write-Host "--- raw output ---"
     Write-Host $result.RawOutput
     exit 1
 }
+
+$agyModel = if ($Model) { $Model } else { 'default' }
+# Finding 2 (final whole-branch review, 2026-08-31): a success-path log entry
+# with a bare 'completed' reason is indistinguishable from a normal full-diff
+# review even when the diff was actually too large and only a file summary
+# (not the real diff) was sent to agy - carry that distinction into the log.
+$successReason = if ($changedLines -gt $MaxDiffLines) { "completed (summary-only review - diff had $changedLines changed lines, over the $MaxDiffLines limit, so only a file summary was sent, not the full diff)" } else { 'completed' }
+Write-DelegationEvent -Skill 'delegate-agy' -Mode 'review' -ProjectDir $ProjectDir -Model $agyModel `
+    -TaskDescription $Description -Outcome 'success' -Reason $successReason `
+    -DurationSeconds $stopwatch.Elapsed.TotalSeconds
 
 Write-Host "--- Agy review ---" -ForegroundColor Green
 Write-Host $result.Text

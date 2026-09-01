@@ -25,6 +25,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot\parse-cline-json.ps1"
+. "$PSScriptRoot\log-event.ps1"
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # VERIFIED 2026-08-31 (final fix wave, Finding 4): under
 # $ErrorActionPreference = 'Stop', a native command's stderr output is wrapped
@@ -125,11 +127,24 @@ $ErrorActionPreference = $prevEAP
 $result = Get-ClineResult -OutputFile $outFile
 
 if ($exitCode -ne 0 -or -not $result.Success) {
+    $guard = if ($changedLines -gt $MaxDiffLines) { 'oversized_diff' } elseif ($result.Reason -match 'empty text') { 'empty_response' } else { $null }
+    Write-DelegationEvent -Skill 'delegate-cline' -Mode 'review' -ProjectDir $ProjectDir -Model $activeProvider `
+        -TaskDescription $Description -Outcome 'failed' -Guard $guard -Reason $result.Reason `
+        -DurationSeconds $stopwatch.Elapsed.TotalSeconds
     Write-Host "Cline review FAILED (exit $exitCode, reason: $($result.Reason))" -ForegroundColor Red
     Write-Host "--- raw output ---"
     Write-Host $result.RawOutput
     exit 1
 }
+
+# Finding 2 (final whole-branch review, 2026-08-31): a success-path log entry
+# with a bare 'completed' reason is indistinguishable from a normal full-diff
+# review even when the diff was actually too large and only a file summary
+# (not the real diff) was sent to cline - carry that distinction into the log.
+$successReason = if ($changedLines -gt $MaxDiffLines) { "completed (summary-only review - diff had $changedLines changed lines, over the $MaxDiffLines limit, so only a file summary was sent, not the full diff)" } else { 'completed' }
+Write-DelegationEvent -Skill 'delegate-cline' -Mode 'review' -ProjectDir $ProjectDir -Model $activeProvider `
+    -TaskDescription $Description -Outcome 'success' -Reason $successReason `
+    -DurationSeconds $stopwatch.Elapsed.TotalSeconds
 
 Write-Host "--- Cline review ---" -ForegroundColor Green
 Write-Host $result.Text
